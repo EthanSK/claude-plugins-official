@@ -19,7 +19,7 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, createWriteStream, existsSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, existsSync, createWriteStream } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 
@@ -28,7 +28,7 @@ const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
 
-// Persistent stderr log. Tee stderr to ~/.claude/channels/telegram/server.log
+// Patch B — persistent stderr log. Tee stderr to ~/.claude/channels/telegram/server.log
 // so post-mortem debugging has something to read when the process dies silently.
 // Rotate when it exceeds ~5MB (truncate to last ~2MB). Runs before any stderr write
 // below so nothing is lost. Does not break existing stderr → harness piping.
@@ -659,16 +659,33 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('telegram channel: shutting down\n')
+  // Patch E — diagnostics at shutdown. Active handles / requests tell us what
+  // was keeping the event loop alive; if a zombie happens we can see whether
+  // the stuck resource was a grammy fetch, the logStream, or something else.
+  try {
+    const handles = (process as any)._getActiveHandles?.() || []
+    const reqs = (process as any)._getActiveRequests?.() || []
+    const rssMB = Math.floor(process.memoryUsage().rss / 1024 / 1024)
+    process.stderr.write(
+      `[shutdown-diag] uptime=${Math.floor(process.uptime())}s handles=${handles.length} requests=${reqs.length} rss=${rssMB}MB\n`,
+    )
+  } catch {}
   try {
     if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
   } catch {}
+  // Destroy the stderr-tee write stream (cheap; drops any buffered writes).
+  try { logStream.destroy() } catch {}
   // bot.stop() signals the poll loop to end; the current getUpdates request
   // may take up to its long-poll timeout to return. Force-exit after 2s.
   setTimeout(() => process.exit(0), 2000)
+  // Hard self-SIGKILL backstop at 5s. Required because process.exit(0) above
+  // can be swallowed if the main thread is stuck in a kernel U-state
+  // (uninterruptible syscall wait) — SIGKILL is kernel-delivered and
+  // terminates unconditionally. No-op if exit(0) already took effect.
+  setTimeout(() => { try { process.kill(process.pid, 'SIGKILL') } catch {} }, 5000)
   void Promise.resolve(bot.stop()).finally(() => process.exit(0))
 }
-
-// Wrap shutdown() with a reason-logged entry point so we can see in
+// Patch C — wrap shutdown() with a reason-logged entry point so we can see in
 // server.log WHY the process decided to die. Every known shutdown trigger routes
 // through here; shutdown() remains the canonical teardown.
 function shutdownWithReason(reason: string, detail?: string): void {
@@ -685,8 +702,8 @@ process.on('SIGHUP', () => shutdownWithReason('SIGHUP'))
 // Orphan watchdog: stdin events above don't reliably fire when the parent
 // chain (`bun run` wrapper → shell → us) is severed by a crash. Poll for
 // reparenting (POSIX) or a dead stdin pipe and self-terminate.
-// Require 3 consecutive polls (15s) of orphaned state before shutdown.
-// Under heavy load (e.g. DAW + browser + many Claude sessions) a single transient
+// Patch A — require 3 consecutive polls (15s) of orphaned state before shutdown.
+// Under heavy load (Ableton + OBS + many Claude sessions) a single transient
 // stdin/ppid glitch used to falsely trigger shutdown. Any clean poll resets
 // the counter, so true reparenting still terminates within ~15s.
 const bootPpid = process.ppid
@@ -709,6 +726,20 @@ setInterval(() => {
     orphanedPolls = 0
   }
 }, 5000).unref()
+
+// Patch D — heartbeat every 60s written to server.log via the stderr tee.
+// Lets post-mortem tell whether the process went quiet BEFORE shutdown (went
+// dark mid-poll) or died during shutdown. If no heartbeats appear for minutes
+// before a zombie death, the plugin was already stuck before shutdown fired.
+setInterval(() => {
+  if (shuttingDown) return
+  try {
+    const rssMB = Math.floor(process.memoryUsage().rss / 1024 / 1024)
+    process.stderr.write(
+      `[heartbeat] uptime=${Math.floor(process.uptime())}s ppid=${process.ppid} rss=${rssMB}MB\n`,
+    )
+  } catch {}
+}, 60000).unref()
 
 // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
 // /status to other group members, (2) confirm bot presence in non-allowlisted
